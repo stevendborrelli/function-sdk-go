@@ -18,6 +18,7 @@ limitations under the License.
 package composed
 
 import (
+	"github.com/go-json-experiment/json"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -25,7 +26,16 @@ import (
 	xpv1 "github.com/crossplane/crossplane-runtime/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/pkg/fieldpath"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
+
+	"github.com/crossplane/function-sdk-go/errors"
 )
+
+// Scheme used to determine the type of any runtime.Object passed to From.
+var Scheme *runtime.Scheme
+
+func init() {
+	Scheme = runtime.NewScheme()
+}
 
 // New returns a new unstructured composed resource.
 func New() *Unstructured {
@@ -34,11 +44,74 @@ func New() *Unstructured {
 
 // From creates a new unstructured composed resource from the supplied object.
 func From(o runtime.Object) (*Unstructured, error) {
-	obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(o)
+	// If the supplied object is already unstructured content, avoid a JSON
+	// round trip and use it.
+	if u, ok := o.(interface{ UnstructuredContent() map[string]any }); ok {
+		return &Unstructured{unstructured.Unstructured{Object: u.UnstructuredContent()}}, nil
+	}
+
+	// Set the object's GVK from our scheme.
+	gvks, _, err := Scheme.ObjectKinds(o)
+	if err != nil {
+		return nil, errors.Wrap(err, "did you add it to composed.Scheme?")
+	}
+	// There should almost never be more than one GVK for a type.
+	for _, gvk := range gvks {
+		o.GetObjectKind().SetGroupVersionKind(gvk)
+	}
+
+	// Round-trip the supplied object through JSON to convert it. We use the
+	// go-json-experiment package for this because it honors the omitempty field
+	// for non-pointer struct fields.
+	//
+	// At the time of writing many Crossplane structs contain fields that have
+	// the omitempty struct tag, but non-pointer struct values. pkg/json does
+	// not omit these fields. It instead includes them as empty JSON objects.
+	// Crossplane will interpret this as part of a server-side apply fully
+	// specified intent and assume the function actually has opinion about the
+	// field when it doesn't. We should make these fields pointers, but it's
+	// easier and safer in the meantime to work around it here.
+	//
+	// https://github.com/go-json-experiment/json#behavior-changes
+	j, err := json.Marshal(o)
 	if err != nil {
 		return nil, err
 	}
+	obj := make(map[string]any)
+	if err := json.Unmarshal(j, &obj); err != nil {
+		return nil, err
+	}
+
+	// Unfortunately we still need to cleanup some object metadata.
+	cleanupMetadata(obj)
+
 	return &Unstructured{unstructured.Unstructured{Object: obj}}, nil
+}
+
+func cleanupMetadata(obj map[string]any) {
+	m, ok := obj["metadata"]
+	if !ok {
+		// If there's no metadata there's nothing to do.
+		return
+	}
+
+	mo, ok := m.(map[string]any)
+	if !ok {
+		// If metadata isn't an object there's nothing to do.
+		return
+	}
+
+	// The ObjectMeta struct that all Kubernetes types include has a non-nil
+	// integer Generation field with the omitempty tag. Regular pkg/json removes
+	// this, but go-json-experiment does not (it would need the new omitzero
+	// tag). So, we clean it up manually. No function should ever be setting it.
+	delete(mo, "generation")
+
+	// If metadata has no fields, delete it. This prevents us from serializing
+	// metadata: {}, which SSA would interpret as "make metadata empty".
+	if len(mo) == 0 {
+		delete(obj, "metadata")
+	}
 }
 
 // An Unstructured composed resource.
@@ -171,12 +244,25 @@ func (cd *Unstructured) GetInteger(path string) (int64, error) {
 	}
 
 	// If not, try return (and truncate) a float64.
-	if f64, err := fieldpath.Pave(cd.Object).GetNumber(path); err == nil {
+	if f64, err := getNumber(p, path); err == nil {
 		return int64(f64), nil
 	}
 
 	// If both fail, return our original error.
 	return 0, err
+}
+
+func getNumber(p *fieldpath.Paved, path string) (float64, error) {
+	v, err := p.GetValue(path)
+	if err != nil {
+		return 0, err
+	}
+
+	f, ok := v.(float64)
+	if !ok {
+		return 0, errors.Errorf("%s: not a (float64) number", path)
+	}
+	return f, nil
 }
 
 // SetValue at the supplied field path.
@@ -197,4 +283,19 @@ func (cd *Unstructured) SetBool(path string, value bool) error {
 // SetInteger value at the supplied field path.
 func (cd *Unstructured) SetInteger(path string, value int64) error {
 	return cd.SetValue(path, value)
+}
+
+// SetObservedGeneration of this Composed resource.
+func (cd *Unstructured) SetObservedGeneration(generation int64) {
+	status := &xpv1.ObservedStatus{}
+	_ = fieldpath.Pave(cd.Object).GetValueInto("status", status)
+	status.SetObservedGeneration(generation)
+	_ = fieldpath.Pave(cd.Object).SetValue("status.observedGeneration", status.ObservedGeneration)
+}
+
+// GetObservedGeneration of this Composed resource.
+func (cd *Unstructured) GetObservedGeneration() int64 {
+	status := &xpv1.ObservedStatus{}
+	_ = fieldpath.Pave(cd.Object).GetValueInto("status", status)
+	return status.GetObservedGeneration()
 }

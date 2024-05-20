@@ -19,6 +19,7 @@ package request
 
 import (
 	"google.golang.org/protobuf/types/known/structpb"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 
 	"github.com/crossplane/function-sdk-go/errors"
@@ -30,7 +31,7 @@ import (
 
 // GetInput from the supplied request. Input is loaded into the supplied object.
 func GetInput(req *v1beta1.RunFunctionRequest, into runtime.Object) error {
-	return errors.Wrap(resource.AsObject(req.GetInput(), into), "cannot get Function input %T from %T, into, req")
+	return errors.Wrapf(resource.AsObject(req.GetInput(), into), "cannot get function input %T from %T", into, req)
 }
 
 // GetContextKey gets context from the supplied key.
@@ -99,7 +100,7 @@ func GetDesiredComposedResources(req *v1beta1.RunFunctionRequest) (map[resource.
 		if err := resource.AsObject(r.GetResource(), dcd.Resource); err != nil {
 			return nil, err
 		}
-		switch r.Ready {
+		switch r.GetReady() {
 		case v1beta1.Ready_READY_UNSPECIFIED:
 			dcd.Ready = resource.ReadyUnspecified
 		case v1beta1.Ready_READY_TRUE:
@@ -110,4 +111,20 @@ func GetDesiredComposedResources(req *v1beta1.RunFunctionRequest) (map[resource.
 		dcds[resource.Name(name)] = dcd
 	}
 	return dcds, nil
+}
+
+// GetExtraResources from the supplied request.
+func GetExtraResources(req *v1beta1.RunFunctionRequest) (map[string][]resource.Extra, error) {
+	out := make(map[string][]resource.Extra, len(req.GetExtraResources()))
+	for name, ers := range req.GetExtraResources() {
+		out[name] = []resource.Extra{}
+		for _, i := range ers.GetItems() {
+			r := &resource.Extra{Resource: &unstructured.Unstructured{}}
+			if err := resource.AsObject(i.GetResource(), r.Resource); err != nil {
+				return nil, err
+			}
+			out[name] = append(out[name], *r)
+		}
+	}
+	return out, nil
 }
